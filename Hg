@@ -1,0 +1,165 @@
+package com.bnpparibas.dec.bookingconfirmation.common.infrastructure.config.metrics;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.sql.DataSource;
+
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.binder.MeterBinder;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.ListableBeanFactory;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.health.contributor.Status;           // Spring Boot 4 (à confirmer par l'IDE)
+import org.springframework.boot.info.BuildProperties;
+import org.springframework.boot.info.GitProperties;
+import org.springframework.boot.jdbc.health.DataSourceHealthIndicator; // Spring Boot 4 (à confirmer par l'IDE)
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+// + tes imports existants : DecSymbols, ZephyrTimeProvider
+
+@Configuration(proxyBeanMethods = false)
+public class CommonMetricsConfig {
+
+    // ------------------------------------------------------------------
+    // Métrique app.info (inchangée)
+    // ------------------------------------------------------------------
+    @Bean
+    public MeterBinder applyInfoMetrics(
+            final ObjectProvider<BuildProperties> buildProperties,
+            final ObjectProvider<GitProperties> gitProperties,
+            final ZephyrTimeProvider zephyrTimeProvider) {
+
+        return registry -> {
+            Tags tags = Tags.empty();
+            final BuildProperties buildProps = buildProperties.getIfAvailable();
+            if (buildProps != null) {
+                final Instant time = buildProps.getTime();
+                String buildTime = DecSymbols.EMPTY;
+                if (time != null) {
+                    buildTime = LocalDateTime.ofInstant(time, zephyrTimeProvider.zone()).toString();
+                }
+                tags = tags.and(
+                        "version", emptyIfNull(buildProps.getVersion()),
+                        "artifact", emptyIfNull(buildProps.getArtifact()),
+                        "build_time", buildTime);
+            }
+            final GitProperties gitProps = gitProperties.getIfAvailable();
+            if (gitProps != null) {
+                tags = tags.and(
+                        "git_commit", emptyIfNull(gitProps.getShortCommitId()),
+                        "git_branch", emptyIfNull(gitProps.getBranch()));
+            }
+            Gauge.builder("app.info", () -> 1)
+                    .description("Build/Version info")
+                    .tags(tags)
+                    .register(registry);
+        };
+    }
+
+    private static String emptyIfNull(final String value) {
+        return value == null ? "" : value;
+    }
+
+    // ------------------------------------------------------------------
+    // Métrique db.up (nouveau) : activée seulement si le module JDBC
+    // est présent dans le service. Sans DataSource, rien n'est enregistré.
+    // ------------------------------------------------------------------
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(name = "org.springframework.boot.jdbc.health.DataSourceHealthIndicator")
+    static class DataSourceMetricsConfig {
+
+        @Bean
+        public DataSourceUpMetrics dataSourceUpMetrics(final ListableBeanFactory beanFactory) {
+            return new DataSourceUpMetrics(beanFactory);
+        }
+    }
+
+    /**
+     * Publie db_up{datasource="...", database="ldd|zephyr"} = 1 (UP) ou 0 (DOWN).
+     * <p>
+     * Les health checks tournent en tâche de fond toutes les 15 s : le scrape
+     * Prometheus lit juste la dernière valeur et n'est jamais bloqué, même si
+     * une base ne répond plus (sinon on attendrait le connectionTimeout Hikari).
+     */
+    static final class DataSourceUpMetrics implements MeterBinder, DisposableBean {
+
+        private static final long CHECK_INTERVAL_SECONDS = 15;
+        private static final String ZEPHYR_PREFIX = "zephyr";
+
+        private final ListableBeanFactory beanFactory;
+        private final Map<String, AtomicInteger> states = new LinkedHashMap<>();
+        private final AtomicBoolean started = new AtomicBoolean();
+        private ScheduledExecutorService scheduler;
+
+        DataSourceUpMetrics(final ListableBeanFactory beanFactory) {
+            this.beanFactory = beanFactory;
+        }
+
+        @Override
+        public void bindTo(final MeterRegistry registry) {
+            final Map<String, DataSource> dataSources = beanFactory.getBeansOfType(DataSource.class);
+            if (dataSources.isEmpty()) {
+                return;
+            }
+            startChecks(dataSources);
+
+            states.forEach((beanName, state) -> Gauge.builder("db.up", state, AtomicInteger::get)
+                    .description("Database availability from health check (1 = UP, 0 = DOWN)")
+                    .tags("datasource", beanName, "database", databaseOf(beanName))
+                    .register(registry));
+        }
+
+        private synchronized void startChecks(final Map<String, DataSource> dataSources) {
+            if (!started.compareAndSet(false, true)) {
+                return;
+            }
+            // Un thread par DataSource : une base lente ne retarde pas les autres
+            scheduler = Executors.newScheduledThreadPool(dataSources.size(), runnable -> {
+                final Thread thread = new Thread(runnable, "db-up-metrics");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+            dataSources.forEach((beanName, dataSource) -> {
+                final AtomicInteger state = new AtomicInteger(0);
+                states.put(beanName, state);
+                final DataSourceHealthIndicator indicator = new DataSourceHealthIndicator(dataSource);
+                scheduler.scheduleWithFixedDelay(
+                        () -> state.set(check(indicator)),
+                        0, CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
+            });
+        }
+
+        private static int check(final DataSourceHealthIndicator indicator) {
+            try {
+                return Status.UP.equals(indicator.health().getStatus()) ? 1 : 0;
+            } catch (final Exception e) {
+                // Ne jamais laisser filer l'exception : elle stopperait la tâche planifiée
+                return 0;
+            }
+        }
+
+        private static String databaseOf(final String beanName) {
+            return beanName.startsWith(ZEPHYR_PREFIX) ? "zephyr" : "ldd";
+        }
+
+        @Override
+        public void destroy() {
+            if (scheduler != null) {
+                scheduler.shutdownNow();
+            }
+        }
+    }
+}
