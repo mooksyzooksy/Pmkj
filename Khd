@@ -1,0 +1,109 @@
+package com.bnpparibas.dec.bookingconfirmation.common.infrastructure.config.metrics;
+
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.binder.MeterBinder;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.health.actuate.endpoint.HealthEndpoint; // Spring Boot 4 (confirm with IDE)
+import org.springframework.boot.health.contributor.Status;              // Spring Boot 4 (confirm with IDE)
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+/**
+ * Publishes app_kafka_up{component="kafka|kafkaConsumer|kafkaProducer"} = 1 (UP) or 0 (DOWN).
+ * <p>
+ * Reads the exact status shown by /actuator/health for each component, so it reuses
+ * your existing Kafka health indicators instead of re-implementing them.
+ * Components missing in a service are simply never registered.
+ */
+@Configuration(proxyBeanMethods = false)
+@ConditionalOnClass(name = "org.springframework.kafka.core.KafkaTemplate")
+public class KafkaHealthMetricsConfig {
+
+    private static final List<String> KAFKA_COMPONENTS = List.of("kafka", "kafkaConsumer", "kafkaProducer");
+
+    @Bean
+    public HealthComponentUpMetrics kafkaUpMetrics(final ObjectProvider<HealthEndpoint> healthEndpoint) {
+        return new HealthComponentUpMetrics("app.kafka.up", healthEndpoint, KAFKA_COMPONENTS);
+    }
+
+    static final class HealthComponentUpMetrics implements MeterBinder, DisposableBean {
+
+        private static final long CHECK_INTERVAL_SECONDS = 60;
+
+        private final String metricName;
+        private final ObjectProvider<HealthEndpoint> healthEndpointProvider;
+        private final List<String> components;
+        private final ConcurrentHashMap<String, AtomicInteger> states = new ConcurrentHashMap<>();
+        private ScheduledExecutorService scheduler;
+
+        HealthComponentUpMetrics(final String metricName,
+                                 final ObjectProvider<HealthEndpoint> healthEndpointProvider,
+                                 final List<String> components) {
+            this.metricName = metricName;
+            this.healthEndpointProvider = healthEndpointProvider;
+            this.components = components;
+        }
+
+        @Override
+        public synchronized void bindTo(final MeterRegistry registry) {
+            final HealthEndpoint healthEndpoint = healthEndpointProvider.getIfAvailable();
+            if (healthEndpoint == null || scheduler != null) {
+                return;
+            }
+            // Single background thread: the Kafka check can take up to its own timeout (10 s),
+            // it must never block startup or the Prometheus scrape.
+            scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+                final Thread thread = new Thread(runnable, "kafka-up-metrics");
+                thread.setDaemon(true);
+                return thread;
+            });
+            scheduler.scheduleWithFixedDelay(() -> checkAll(healthEndpoint, registry),
+                    0, CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        }
+
+        private void checkAll(final HealthEndpoint healthEndpoint, final MeterRegistry registry) {
+            for (final String component : components) {
+                try {
+                    final var health = healthEndpoint.healthForPath(component);
+                    if (health == null) {
+                        continue; // component not present in this service
+                    }
+                    final int value = Status.UP.equals(health.getStatus()) ? 1 : 0;
+                    states.computeIfAbsent(component, name -> register(name, registry)).set(value);
+                } catch (final Exception e) {
+                    // Never let an exception escape: it would stop the scheduled task
+                    final AtomicInteger state = states.get(component);
+                    if (state != null) {
+                        state.set(0);
+                    }
+                }
+            }
+        }
+
+        private AtomicInteger register(final String component, final MeterRegistry registry) {
+            final AtomicInteger state = new AtomicInteger(0);
+            Gauge.builder(metricName, state, AtomicInteger::get)
+                    .description("Kafka availability from health check (1 = UP, 0 = DOWN)")
+                    .tag("component", component)
+                    .register(registry);
+            return state;
+        }
+
+        @Override
+        public void destroy() {
+            if (scheduler != null) {
+                scheduler.shutdownNow();
+            }
+        }
+    }
+}
